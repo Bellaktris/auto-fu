@@ -1406,13 +1406,32 @@ afu-install-installer () {
           zle -K afu-vicmd
         }
 
+        afu+vi-visual-yank()
+        {
+            zle vi-visual-yank
+            # kind of hacky
+            zle -K afu
+            zle -K afu-vicmd
+        }
+
+        afu+vi-visual-change()
+        {
+            zle vi-visual-change
+            # kind of hacky
+            zle -K afu
+        }
+
         zle -N afu+vi-visual-exit
         zle -N afu+vi-visual-kill-and-insert
         zle -N afu+vi-visual-kill-and-vicmd
+        zle -N afu+vi-visual-change
+        zle -N afu+vi-visual-yank
 
-        bindkey -M vivis 'x' afu+vi-visual-kill-and-vicmd
         bindkey -M vivis 'c' afu+vi-visual-kill-and-insert
+        bindkey -M vivis 'x' afu+vi-visual-kill-and-vicmd
+        bindkey -M vivis 'c' afu+vi-visual-change
         bindkey -M vivis "\e" afu+vi-visual-exit
+        bindkey -M vivis 'y' afu+vi-visual-yank
       fi
     }
 EOT
