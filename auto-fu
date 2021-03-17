@@ -137,11 +137,8 @@ auto-fu-magic-space () {
 	fi
 	zle .magic-space
 }
-afu-cursor-right () {
-	(( CURSOR += 1 ))
-}
 auto-fu-preexec () {
-	echo -en '[0m'
+	echo -en "\e[0m"
 }
 afu-rh-highlight-state-update () {
 	afu_rh_state+=(old "${afu_rh_state[cur]-}")
@@ -430,9 +427,6 @@ afu-zle-force-install () {
 	zle -N yank yank-by-keymap
 	zle -C complete-word .complete-word _main_complete
 	zle -C list-choices .list-choices _main_complete
-}
-afu-cursor-left () {
-	(( CURSOR -= 1 ))
 }
 auto-fu () {
 	[[ ${#LBUFFER} != ${#BUFFER} && $BUFFER[(( ${#LBUFFER} + 1 ))] != ' ' ]] && return
