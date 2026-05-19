@@ -1,0 +1,159 @@
+#!zsh
+# auto-fu-widgets: ZLE widget wrappers and keymap delegation functions
+
+# --- afu+ widget wrappers (delegate to with-afu~) ---
+
+afu+self-insert () {
+	with-afu~ .self-insert self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+afu+backward-delete-char () {
+	with-afu~ .backward-delete-char self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+afu+backward-kill-word () {
+	with-afu~ .backward-kill-word self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+afu+kill-line () {
+	with-afu~ .kill-line self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+afu+kill-whole-line () {
+	with-afu~ .kill-whole-line self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+afu+kill-word () {
+	with-afu~ .kill-word self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+afu+magic-space () {
+	with-afu~ .magic-space self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+afu+yank () {
+	with-afu~ .yank self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
+}
+
+# --- Accept-line widgets ---
+
+afu+accept-line () {
+	__accepted=($WIDGET ${=NUMERIC:+-n $NUMERIC} "$@")
+	zle .accept-line
+	zstyle -T ':auto-fu:var' postdisplay/clearp && POSTDISPLAY=""
+	return 0
+}
+afu+accept-and-hold () {
+	__accepted=($WIDGET ${=NUMERIC:+-n $NUMERIC} "$@")
+	zle .accept-and-hold
+	zstyle -T ':auto-fu:var' postdisplay/clearp && POSTDISPLAY=""
+	return 0
+}
+afu+accept-line-and-down-history () {
+	__accepted=($WIDGET ${=NUMERIC:+-n $NUMERIC} "$@")
+	zle .accept-line-and-down-history
+	zstyle -T ':auto-fu:var' postdisplay/clearp && POSTDISPLAY=""
+	return 0
+}
+
+# --- Vi mode widgets ---
+
+afu+vi-cmd-mode () {
+	((afu_in_p==1)) && BUFFER="$buffer_cur"
+	zle -K afu-vicmd
+}
+afu+vi-ins-mode () {
+	zle -K afu
+}
+afu+vi-visual-exit () {
+	zle vi-visual-exit
+	zle -K afu
+	zle -K afu-vicmd
+}
+afu+vi-visual-kill-and-insert () {
+	zle vi-visual-kill-and-vicmd
+	zle -K afu
+}
+afu+vi-visual-kill-and-vicmd () {
+	zle vi-visual-kill-and-vicmd
+	zle -K afu
+	zle -K afu-vicmd
+}
+
+# --- EOF widgets ---
+
+afu+orf-ignoreeof-deletechar-list () {
+	afu-eof-maybe afu-ignore-eof zle delete-char-or-list
+}
+afu+orf-exit-deletechar-list () {
+	afu-eof-maybe exit zle delete-char-or-list
+}
+
+# --- Cursor movement ---
+
+afu-cursor-right () {
+	(( CURSOR += 1 ))
+}
+afu-cursor-left () {
+	(( CURSOR -= 1 ))
+}
+
+# --- Keymap delegation wrappers ---
+
+self-insert-by-keymap () {
+	if (( $+widgets[$KEYMAP+self-insert] == 1 ))
+	then
+		zle $KEYMAP+self-insert "$@"
+	else
+		zle .self-insert "$@"
+	fi
+}
+backward-delete-char-by-keymap () {
+	if (( $+widgets[$KEYMAP+backward-delete-char] == 1 ))
+	then
+		zle $KEYMAP+backward-delete-char "$@"
+	else
+		zle .backward-delete-char "$@"
+	fi
+}
+backward-kill-word-by-keymap () {
+	if (( $+widgets[$KEYMAP+backward-kill-word] == 1 ))
+	then
+		zle $KEYMAP+backward-kill-word "$@"
+	else
+		zle .backward-kill-word "$@"
+	fi
+}
+kill-line-by-keymap () {
+	if (( $+widgets[$KEYMAP+kill-line] == 1 ))
+	then
+		zle $KEYMAP+kill-line "$@"
+	else
+		zle .kill-line "$@"
+	fi
+}
+kill-whole-line-by-keymap () {
+	if (( $+widgets[$KEYMAP+kill-whole-line] == 1 ))
+	then
+		zle $KEYMAP+kill-whole-line "$@"
+	else
+		zle .kill-whole-line "$@"
+	fi
+}
+kill-word-by-keymap () {
+	if (( $+widgets[$KEYMAP+kill-word] == 1 ))
+	then
+		zle $KEYMAP+kill-word "$@"
+	else
+		zle .kill-word "$@"
+	fi
+}
+magic-space-by-keymap () {
+	if (( $+widgets[$KEYMAP+magic-space] == 1 ))
+	then
+		zle $KEYMAP+magic-space "$@"
+	else
+		zle .magic-space "$@"
+	fi
+}
+yank-by-keymap () {
+	if (( $+widgets[$KEYMAP+yank] == 1 ))
+	then
+		zle $KEYMAP+yank "$@"
+	else
+		zle .yank "$@"
+	fi
+}

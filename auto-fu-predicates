@@ -1,0 +1,159 @@
+#!zsh
+# auto-fu-predicates: Functions that decide when NOT to auto-complete
+
+afu-able-p () {
+	local pred=
+	zstyle -s ':auto-fu:var' autoablep-function pred
+	"${pred:-auto-fu-default-autoable-pred}"
+	return $?
+}
+
+auto-fu-default-autoable-pred () {
+	local -a ps
+	zstyle -a ':auto-fu:var' autoable-function/preds ps
+	(( $#ps )) || {
+		afu-autoable-default-functions ps
+	}
+	local -a reply
+	local -i REPLY REPLY2
+	local -a areply
+	afu-split-shell-arguments
+	local word="${reply[REPLY]-}"
+	local commandish="${areply[1]-}"
+	local p
+	for p in $ps
+	do
+		local ret=0
+		"$p" "$word" "$commandish" "${(j..)areply[1,((REPLY-1))]}" "${(j..)areply[1,-1]}"
+		ret=$?
+		((ret == 1)) && return 1
+		((ret ==-1)) && return 0
+	done
+	return 0
+}
+
+afu-autoable-default-functions () {
+	local place="$1"
+	afu-error-symif "$0" "$place" defaults || return $?
+	local -a defaults
+	defaults=(afu-autoable-paused-p afu-autoable-large-dir-p afu-autoable-space-p afu-autoable-skipword-p afu-autoable-specials-p afu-autoable-skiplbuffer-p afu-autoable-skipline-p)
+	: ${(PA)place::=$defaults}
+}
+
+afu-autoable-paused-p () {
+	(( afu_paused_p == 0 ))
+}
+
+afu-autoable-space-p () {
+	local c=$LBUFFER[-1]
+	[[ $c == '' ]] && return 1
+	[[ $c == ' ' ]] && {
+		afu-able-space-p || return 1
+	}
+	return 0
+}
+
+afu-able-space-p () {
+	[[ -z ${AUTO_FU_NOCP-} ]] && {
+		[[ "$WIDGET" == "magic-space" ]] || return 1
+	}
+	local -a x
+	: ${(A)x::=${(z)LBUFFER}}
+	[[ $x[1] != man ]]
+}
+
+afu-autoable-skipword-p () {
+	local word="$1"
+	afu-autoable-skip-pred word autoable-function/skipwords afu-autoable-skipword-p-default
+}
+
+afu-autoable-skipword-p-default () {
+	afu-error-symif "$0" "$1" a tmp || return $?
+	local -a a
+	a=("'" "$'" "$histchars[1]")
+	local -a tmp
+	tmp=("(${(j.|.)a})*")
+	: ${(PA)1::=$tmp}
+}
+
+afu-autoable-skiplbuffer-p () {
+	local lbuffer="$3"
+	afu-autoable-skip-pred lbuffer autoable-function/skiplbuffers
+}
+
+afu-autoable-skipline-p () {
+	local line="$4"
+	afu-autoable-skip-pred line autoable-function/skiplines
+}
+
+afu-autoable-specials-p () {
+	zmodload zsh/regex
+	# Check for unbalanced quotes using counting instead of backtracking regex
+	local -i dq=0 sq=0 i
+	for (( i=1; i<=${#LBUFFER}; i++ )); do
+		case $LBUFFER[$i] in
+			('"') (( sq == 0 )) && (( dq = !dq )) ;;
+			("'") (( dq == 0 )) && (( sq = !sq )) ;;
+		esac
+	done
+	(( dq || sq )) && return 1
+	[[ $LBUFFER[-1] -regex-match "[<> \[\(\)&\|;\"']" ]] && return 1
+	[[ $LBUFFER[-1] -regex-match "\]" ]] && return 1
+	[[ $LBUFFER -regex-match "^.*rm\s*-[a-zA-Z]*$" ]] && return 1
+	return 0
+}
+
+afu-autoable-large-dir-p () {
+	local words=(${(s: :)LBUFFER})
+	[[ ${words[-1][-1]} == '/' ]] && words[-1]=${words[-1]%/}
+	local dir="${words[-1]}"
+	[[ -d "$dir" ]] || return 0
+	local -a entries
+	entries=( $dir/*(NY201) )
+	(( ${#entries} > 200 )) && return 1 || return 0
+}
+
+afu-autoable-skip-pred () {
+	local place="$1"
+	local style="$2"
+	local deffn="${3-}"
+	local value="${(P)place}"
+	local -a skips
+	skips=()
+	zstyle -a ':auto-fu:var' "$style" skips
+	(($#skips==0)) && [[ -n "$deffn" ]] && {
+		"$deffn" skips
+	}
+	local skip
+	for skip in $skips
+	do
+		[[ "${value}" == ${~skip} ]] && {
+			[[ -n "${AUTO_FU_DEBUG-}" ]] && {
+				echo "***BREAK*** ${skip}" >> ${AUTO_FU_DEBUG-}
+			}
+			return 1
+		}
+	done
+	return 0
+}
+
+afu-split-shell-arguments () {
+	autoload -U split-shell-arguments
+	split-shell-arguments
+	((REPLY & 1)) && ((REPLY--))
+	((REPLY2 = ${#reply[REPLY]-} + 1))
+	local -i p
+	local -a tmp
+	: ${(A)tmp::=$reply[1,REPLY]}
+	p=${tmp[(I)(\||\|\||;|&|&&)]}
+	((p)) && ((p+=2)) || ((p=1))
+	while [[ ${tmp[p]-} == (noglob|nocorrect|builtin|command) ]]
+	do
+		((p+=2))
+	done
+	((p!=1)) && ((p++))
+	: ${(A)tmp::=$reply[p,-1]}
+	p=${tmp[(I)(\||\|\||;|&|&&)]}
+	((p)) && ((p-=2)) || ((p=-1))
+	: ${(A)areply::=${tmp[1,p]}}
+}
