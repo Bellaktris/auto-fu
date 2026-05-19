@@ -125,7 +125,7 @@ auto-fu-deactivate () {
 }
 auto-fu-magic-space () {
 	if {
-			afu-autoable-paused-p || false
+			afu-autoable-paused-p
 		} && [[ -n "${_lastcomp[prefix]-}" ]] && [[ -n "${_lastcomp[unambiguous]-}" ]] && [[ "${_lastcomp[insert_positions]-}" != *:* ]] && [[ "${_lastcomp[prefix]-}" == "${_lastcomp[unambiguous]}" ]] && ((CURSOR == $_lastcomp[insert_positions])) && [[ "$LBUFFER" == *"${_lastcomp[prefix]-}" ]] && [[ "$LBUFFER" == *[^[:space:]=]/ ]]
 	then
 		LBUFFER="$LBUFFER[1,-2]"
@@ -256,12 +256,18 @@ afu+accept-and-hold () {
 }
 afu-autoable-specials-p () {
 	zmodload zsh/regex
-	! [[ $LBUFFER -regex-match "^(\"([^\"]*)\"|'([^']*)'|[^'\"]*)*$" ]] && return 1
-	[[ $LBUFFER -regex-match "^.*\"$" ]] && return 1
-	[[ $LBUFFER -regex-match "^.*'$" ]] && return 1
-	[[ $LBUFFER[-1] -regex-match "[<> [\(\)&\|;\"']" ]] && return 1
+	# Check for unbalanced quotes using counting instead of backtracking regex
+	local -i dq=0 sq=0 i
+	for (( i=1; i<=${#LBUFFER}; i++ )); do
+		case $LBUFFER[$i] in
+			('"') (( sq == 0 )) && (( dq = !dq )) ;;
+			("'") (( dq == 0 )) && (( sq = !sq )) ;;
+		esac
+	done
+	(( dq || sq )) && return 1
+	[[ $LBUFFER[-1] -regex-match "[<> \[\(\)&\|;\"']" ]] && return 1
 	[[ $LBUFFER[-1] -regex-match "\]" ]] && return 1
-	(( ${#BUFFER} > ${#LBUFFER} )) && [[ $LBUFFER -regex-match "^.*rm\s*-[a-zA-Z]*$" ]] && return 1
+	[[ $LBUFFER -regex-match "^.*rm\s*-[a-zA-Z]*$" ]] && return 1
 	return 0
 }
 with-afu-completer-vars () {
@@ -298,14 +304,12 @@ yank-by-keymap () {
 }
 afu-autoable-large-dir-p () {
 	local words=(${(s: :)LBUFFER})
-	[[ ${words[-1][-1]} == '/' ]] && words[-1]=${words[-1]:h}
+	[[ ${words[-1][-1]} == '/' ]] && words[-1]=${words[-1]%/}
 	local dir="${words[-1]}"
 	[[ -d "$dir" ]] || return 0
-	if (( $+commands[zsh-count-files] )); then
-		(( $(zsh-count-files "$dir") > 200 )) && return 1 || return 0
-	else
-		(( $(command ls -1f "$dir" 2>/dev/null | command head -n 201 | command wc -l) > 200 )) && return 1 || return 0
-	fi
+	local -a entries
+	entries=( $dir/*(NY201) )
+	(( ${#entries} > 200 )) && return 1 || return 0
 }
 with-afu-menuselecting-handling () {
 	local fn="$1"
@@ -986,7 +990,7 @@ with-afu-compfuncs () {
 	comppostfuncs=(afu-comppost)
 	"$@"
 }
-zle-line-init() { afu_in_p=0; auto-fu-init; }
+afu-zle-line-init() { afu_in_p=0; auto-fu-init; }
 afu-install () {
 	zstyle -t ':auto-fu:var' misc-installed-p || {
 		zmodload zsh/parameter 2> /dev/null || {
@@ -1067,10 +1071,23 @@ auto-fu-install () {
 		zle -N auto-fu-toggle
 	}
 	afu-install
+
+	# Chain with existing zle-line-init instead of clobbering
+	if (( $+functions[zle-line-init] )); then
+		functions[_afu_orig_zle_line_init]=$functions[zle-line-init]
+		zle-line-init() { afu-zle-line-init; _afu_orig_zle_line_init; }
+	else
+		zle-line-init() { afu-zle-line-init; }
+	fi
 	zle -N zle-line-init
-	zle-keymap-select () {
-		auto-fu-zle-keymap-select "$@"
-	}
+
+	# Chain with existing zle-keymap-select instead of clobbering
+	if (( $+functions[zle-keymap-select] )); then
+		functions[_afu_orig_zle_keymap_select]=$functions[zle-keymap-select]
+		zle-keymap-select() { auto-fu-zle-keymap-select "$@"; _afu_orig_zle_keymap_select "$@"; }
+	else
+		zle-keymap-select() { auto-fu-zle-keymap-select "$@"; }
+	fi
 	zle -N zle-keymap-select
 	if [[ $keymaps =~ .*vivis.* ]]
 	then
