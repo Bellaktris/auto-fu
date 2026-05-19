@@ -1,32 +1,16 @@
 #!zsh
 # auto-fu-widgets: ZLE widget wrappers and keymap delegation functions
 
-# --- afu+ widget wrappers (delegate to with-afu~) ---
+# Shared list of wrapped editing widgets (used by auto-fu core too)
+typeset -ga _afu_wrapped_widgets
+_afu_wrapped_widgets=(self-insert backward-delete-char backward-kill-word
+                      kill-line kill-whole-line kill-word magic-space yank)
 
-afu+self-insert () {
-	with-afu~ .self-insert self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
-afu+backward-delete-char () {
-	with-afu~ .backward-delete-char self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
-afu+backward-kill-word () {
-	with-afu~ .backward-kill-word self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
-afu+kill-line () {
-	with-afu~ .kill-line self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
-afu+kill-whole-line () {
-	with-afu~ .kill-whole-line self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
-afu+kill-word () {
-	with-afu~ .kill-word self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
-afu+magic-space () {
-	with-afu~ .magic-space self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
-afu+yank () {
-	with-afu~ .yank self-insert backward-delete-char backward-kill-word kill-line kill-whole-line kill-word magic-space yank
-}
+# --- Generate afu+ widget wrappers (delegate to with-afu~) ---
+
+for _afu_w in $_afu_wrapped_widgets; do
+	eval "afu+$_afu_w () { with-afu~ .$_afu_w $_afu_wrapped_widgets }"
+done
 
 # --- Accept-line widgets ---
 
@@ -91,69 +75,15 @@ afu-cursor-left () {
 	(( CURSOR -= 1 ))
 }
 
-# --- Keymap delegation wrappers ---
+# --- Generate keymap delegation wrappers ---
 
-self-insert-by-keymap () {
-	if (( $+widgets[$KEYMAP+self-insert] == 1 ))
-	then
-		zle $KEYMAP+self-insert "$@"
-	else
-		zle .self-insert "$@"
-	fi
-}
-backward-delete-char-by-keymap () {
-	if (( $+widgets[$KEYMAP+backward-delete-char] == 1 ))
-	then
-		zle $KEYMAP+backward-delete-char "$@"
-	else
-		zle .backward-delete-char "$@"
-	fi
-}
-backward-kill-word-by-keymap () {
-	if (( $+widgets[$KEYMAP+backward-kill-word] == 1 ))
-	then
-		zle $KEYMAP+backward-kill-word "$@"
-	else
-		zle .backward-kill-word "$@"
-	fi
-}
-kill-line-by-keymap () {
-	if (( $+widgets[$KEYMAP+kill-line] == 1 ))
-	then
-		zle $KEYMAP+kill-line "$@"
-	else
-		zle .kill-line "$@"
-	fi
-}
-kill-whole-line-by-keymap () {
-	if (( $+widgets[$KEYMAP+kill-whole-line] == 1 ))
-	then
-		zle $KEYMAP+kill-whole-line "$@"
-	else
-		zle .kill-whole-line "$@"
-	fi
-}
-kill-word-by-keymap () {
-	if (( $+widgets[$KEYMAP+kill-word] == 1 ))
-	then
-		zle $KEYMAP+kill-word "$@"
-	else
-		zle .kill-word "$@"
-	fi
-}
-magic-space-by-keymap () {
-	if (( $+widgets[$KEYMAP+magic-space] == 1 ))
-	then
-		zle $KEYMAP+magic-space "$@"
-	else
-		zle .magic-space "$@"
-	fi
-}
-yank-by-keymap () {
-	if (( $+widgets[$KEYMAP+yank] == 1 ))
-	then
-		zle $KEYMAP+yank "$@"
-	else
-		zle .yank "$@"
-	fi
-}
+for _afu_w in $_afu_wrapped_widgets; do
+	eval "$_afu_w-by-keymap () {
+		if (( \$+widgets[\$KEYMAP+$_afu_w] == 1 )); then
+			zle \$KEYMAP+$_afu_w \"\$@\"
+		else
+			zle .$_afu_w \"\$@\"
+		fi
+	}"
+done
+unset _afu_w

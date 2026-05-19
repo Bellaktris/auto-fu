@@ -21,26 +21,19 @@ afu-zle-complete-word () {
 # --- ZLE rebinding ---
 
 afu-zle-rebind-restore () {
-	zle -N self-insert ${(ok)functions[(I)_zsh_highlight_widget_*-self-insert]}
-	zle -N backward-delete-char ${(ok)functions[(I)_zsh_highlight_widget_*-backward-delete-char]}
-	zle -N backward-kill-word ${(ok)functions[(I)_zsh_highlight_widget_*-backward-kill-word]}
-	zle -N kill-line ${(ok)functions[(I)_zsh_highlight_widget_*-kill-line]}
-	zle -N kill-whole-line ${(ok)functions[(I)_zsh_highlight_widget_*-kill-whole-line]}
-	zle -N kill-word ${(ok)functions[(I)_zsh_highlight_widget_*-kill-word]}
-	zle -N magic-space ${(ok)functions[(I)_zsh_highlight_widget_*-magic-space]}
+	local _w
+	for _w in ${_afu_wrapped_widgets:#yank}; do
+		zle -N $_w ${(ok)functions[(I)_zsh_highlight_widget_*-$_w]}
+	done
 	zle -C complete-word .complete-word _main_complete
 	zle -C list-choices .list-choices _main_complete
 }
 
 afu-zle-force-install () {
-	zle -N self-insert self-insert-by-keymap
-	zle -N backward-delete-char backward-delete-char-by-keymap
-	zle -N backward-kill-word backward-kill-word-by-keymap
-	zle -N kill-line kill-line-by-keymap
-	zle -N kill-whole-line kill-whole-line-by-keymap
-	zle -N kill-word kill-word-by-keymap
-	zle -N magic-space magic-space-by-keymap
-	zle -N yank yank-by-keymap
+	local _w
+	for _w in $_afu_wrapped_widgets; do
+		zle -N $_w $_w-by-keymap
+	done
 	zle -C complete-word .complete-word _main_complete
 	zle -C list-choices .list-choices _main_complete
 }
@@ -48,7 +41,10 @@ afu-zle-force-install () {
 with-afu-zle-rebinding () {
 	local -a restores
 	{
-		eval "$(afu-rebind-expand restores self-insert; afu-rebind-expand restores backward-delete-char; afu-rebind-expand restores backward-kill-word; afu-rebind-expand restores kill-line; afu-rebind-expand restores kill-whole-line; afu-rebind-expand restores kill-word; afu-rebind-expand restores magic-space; afu-rebind-expand restores yank; afu-rebind-expand restores complete-word; afu-rebind-expand restores list-choices;)"
+		local _w
+		for _w in $_afu_wrapped_widgets complete-word list-choices; do
+			eval "$(afu-rebind-expand restores $_w)"
+		done
 		afu-zle-force-install
 		{
 			"$@"
@@ -310,7 +306,7 @@ _afu_match () {
 	ret=$?
 	afu_match_ret=$ret
 	afu-completer-init-maybe $ret
-	return ret
+	return $ret
 }
 _afu_approximate () {
 	local ret=
@@ -319,7 +315,7 @@ _afu_approximate () {
 	ret=$?
 	afu_approximate_correcting_p=$ret
 	afu-completer-init-maybe $ret
-	return ret
+	return $ret
 }
 afu-completer-init-maybe () {
 	local -i ret="$1"
@@ -331,7 +327,7 @@ afu-completer-init-maybe () {
 		fi
 		_message "%B{%b $b %B}%b"
 	}
-	return ret
+	return $ret
 }
 afu-hmbk-selected-key-p () {
 	[[ $KEYS[-1] == ' ' ]] && {
@@ -354,44 +350,6 @@ with-afu-menuselecting-handling () {
 		return
 	}
 	local force_menuselect_off_p=
-	(( $+functions[afu-handle-menuselecting-buffer-keep-p] )) && [[ -z ${AUTO_FU_NOFUNCMEMO-} ]] || afu-handle-menuselecting-buffer-keep-p () {
-		[[ "${afu_curcompleter-}" == ${~inserts} ]] && {
-			[[ -n ${afu_approximate_correcting_p-} ]] && {
-				{
-					afu-hmbk-selected-key-p
-				} && {
-					force_menuselect_off_p=t
-					return 0
-				}
-				[[ $KEYS[-1] == [[:]] ]] && {
-					[[ $LBUFFER[-1] == ' ' ]] && {
-						LBUFFER=$LBUFFER[1,-2]
-					}
-					[[ $LBUFFER[-1] == $KEYS[-1] ]] && {
-						LBUFFER=$LBUFFER[1,-2]
-					}
-					return 0
-				}
-			}
-			[[ -n ${afu_match_ret-} ]] && ((${afu_match_ret} == 0)) && {
-				((${_lastcomp[nmatches]} == 1)) && return 0
-				afu_match_rec_p=t
-				{
-					afu-hmbk-selected-key-p
-				} && return 0 || return 1
-			}
-			{
-				afu-hmbk-selected-key-p
-			} || {
-				[[ $LBUFFER[-1] == $KEYS[-1] ]] && [[ $LBUFFER[-1] == '/' ]] && {
-
-				} && {
-					LBUFFER=$LBUFFER[1,-2]
-					force_menuselect_off_p=t
-				}
-			}
-		}
-	}
 	$fn afu-handle-menuselecting-buffer-keep-p
 	[[ "${afu_curcompleter-}" == ignored ]] && return
 	[[ -n ${last_afuapproximatecorrecting_p-} ]] && return
@@ -531,7 +489,7 @@ auto-fu-maybe () {
 		with-afu-menuselecting-handling auto-fu
 		ret=0
 	}
-	return ret
+	return $ret
 }
 
 auto-fu () {
@@ -897,6 +855,18 @@ afu-handle-menuselecting-buffer-keep-p () {
 
 # --- Init and install ---
 
+afu-chain-zle-hook () {
+	local hook="$1" newfn="$2"
+	local saved="_afu_orig_${hook//-/_}"
+	if (( $+functions[$hook] )); then
+		functions[$saved]=$functions[$hook]
+		eval "$hook () { $newfn \"\$@\"; $saved \"\$@\"; }"
+	else
+		eval "$hook () { $newfn \"\$@\"; }"
+	fi
+	zle -N $hook
+}
+
 auto-fu-init () {
 	with-afu-zle-rebinding afu-line-init
 }
@@ -955,23 +925,6 @@ afu-install-preexec () {
 afu-install-isearchmap () {
 	zstyle ':auto-fu:var' isearchmap-installed-p yes
 }
-afu-install-forall () {
-	local a
-	for a in "$@"
-	do
-		"$a"
-	done
-}
-'afu-install~' () {
-	afu-install afu-install-forall afu-initialize-zle-afu "$@" afu-initialize-zle-contrib afu-keymap+widget afu-initialize-rebinds
-	() {
-		[[ -z ${AUTO_FU_NOCP-} ]] || return
-		zstyle ':auto-fu:highlight' input bold
-		zstyle ':auto-fu:highlight' completion fg=black,bold
-		zstyle ':auto-fu:highlight' completion/one fg=black,bold
-		zstyle ':auto-fu:var' postdisplay $'\n'
-	}
-}
 
 afu-install () {
 	zstyle -t ':auto-fu:var' misc-installed-p || {
@@ -1015,8 +968,6 @@ auto-fu-install () {
 	afu_zle_contribs=()
 	typeset -ga afu_rhs_no_kills
 	afu_rhs_no_kills=()
-	typeset -gA afu_rebinds_pre
-	afu_rebinds_pre=()
 	typeset -gA afu_rebinds_post
 	afu_rebinds_post=()
 	{
@@ -1055,47 +1006,15 @@ auto-fu-install () {
 	}
 	afu-install
 
-	# Chain with existing zle-line-init instead of clobbering
-	if (( $+functions[zle-line-init] )); then
-		functions[_afu_orig_zle_line_init]=$functions[zle-line-init]
-		zle-line-init() { afu-zle-line-init; _afu_orig_zle_line_init; }
-	else
-		zle-line-init() { afu-zle-line-init; }
-	fi
-	zle -N zle-line-init
-
-	# Chain with existing zle-keymap-select instead of clobbering
-	if (( $+functions[zle-keymap-select] )); then
-		functions[_afu_orig_zle_keymap_select]=$functions[zle-keymap-select]
-		zle-keymap-select() { auto-fu-zle-keymap-select "$@"; _afu_orig_zle_keymap_select "$@"; }
-	else
-		zle-keymap-select() { auto-fu-zle-keymap-select "$@"; }
-	fi
-	zle -N zle-keymap-select
+	afu-chain-zle-hook zle-line-init afu-zle-line-init
+	afu-chain-zle-hook zle-keymap-select auto-fu-zle-keymap-select
 	if [[ $keymaps =~ .*vivis.* ]]
 	then
-		afu+vi-visual-exit () {
-			zle vi-visual-exit
-			zle -K afu
-			zle -K afu-vicmd
-		}
-		afu+vi-visual-kill-and-insert () {
-			zle vi-visual-kill-and-vicmd
-			zle -K afu
-		}
-		afu+vi-visual-kill-and-vicmd () {
-			zle vi-visual-kill-and-vicmd
-			zle -K afu
-			zle -K afu-vicmd
-		}
 		afu+vi-visual-yank () {
 			zle vi-visual-yank
 			zle -K afu
 			zle -K afu-vicmd
 		}
-		zle -N afu+vi-visual-exit
-		zle -N afu+vi-visual-kill-and-insert
-		zle -N afu+vi-visual-kill-and-vicmd
 		zle -N afu+vi-visual-yank
 		bindkey -M vivis 'x' afu+vi-visual-kill-and-vicmd
 		bindkey -M vivis 'c' afu+vi-visual-kill-and-insert
