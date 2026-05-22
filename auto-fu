@@ -441,7 +441,7 @@ afu+complete-word () {
 				afu_magic_insert_p=t
 				afu-zle-complete-word
 			}
-			if [[ $LBUFFER[-1] != '/' ]]
+			if [[ $LBUFFER[-1] != '/' ]] || (( ${_lastcomp[nmatches]:-0} > 1 ))
 			then
 				afu-zle-complete-word
 				[[ $_lastcomp =~ "automenu-unambiguous" ]] && [[ $LBUFFER[-1] != [[:space:]] ]] && afu-zle-complete-word
