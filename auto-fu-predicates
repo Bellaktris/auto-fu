@@ -1,159 +1,212 @@
 #!zsh
-# auto-fu-predicates: Functions that decide when NOT to auto-complete
+# auto-fu-predicates: may auto-fu complete at this point in the line?
+#
+# This runs once per keystroke, so it is the hot path: plain globs instead of
+# regexes (no zsh/regex, no backtracking), no forks, and nothing that scales
+# with the length of the buffer.
+#
+# Predicate protocol.  Every function in the ':auto-fu:var
+# autoable-function/preds' style is called with
+#
+#   $1  the word under the cursor
+#   $2  the command that word belongs to
+#   $3  the line up to (not including) that word
+#   $4  the whole command that word belongs to
+#
+# and returns
+#
+#   0    no opinion - ask the next predicate
+#   1    veto - do not complete here
+#   255  allow - complete here, skip the remaining predicates
+#
+# 255 rather than -1 because `return -1` is what zsh turns into 255; writing it
+# as -1 made the comparison in auto-fu-default-autoable-pred silently never
+# match.  No predicate shipped here uses it; it exists for user predicates.
 
+typeset -ga _afu_default_autoable_preds
+_afu_default_autoable_preds=(
+	afu-autoable-paused-p
+	afu-autoable-large-dir-p
+	afu-autoable-space-p
+	afu-autoable-skipword-p
+	afu-autoable-specials-p
+	afu-autoable-skiplbuffer-p
+	afu-autoable-skipline-p
+)
+
+# Entry point.  ':auto-fu:var autoablep-function' can replace the whole
+# decision with a single function of your own.
 afu-able-p () {
 	local pred=
 	zstyle -s ':auto-fu:var' autoablep-function pred
 	"${pred:-auto-fu-default-autoable-pred}"
-	return $?
 }
 
 auto-fu-default-autoable-pred () {
 	local -a ps
 	zstyle -a ':auto-fu:var' autoable-function/preds ps
-	(( $#ps )) || {
-		afu-autoable-default-functions ps
-	}
-	local -a reply
+	(( $#ps )) || ps=( $_afu_default_autoable_preds )
+
+	# afu-split-shell-arguments fills reply/REPLY/REPLY2 (every word and
+	# separator of the line, plus the index of the one under the cursor) and
+	# areply (just the command the cursor is in).
+	local -a reply areply
 	local -i REPLY REPLY2
-	local -a areply
 	afu-split-shell-arguments
-	local word="${reply[REPLY]-}"
-	local commandish="${areply[1]-}"
+
+	local word="${reply[REPLY]-}" commandish="${areply[1]-}"
 	local p
-	for p in $ps
-	do
-		local ret=0
-		"$p" "$word" "$commandish" "${(j..)areply[1,((REPLY-1))]}" "${(j..)areply[1,-1]}"
+	local -i ret
+	for p in $ps; do
+		"$p" "$word" "$commandish" "${(j..)areply[1,REPLY-1]}" "${(j..)areply}"
 		ret=$?
-		((ret == 1)) && return 1
-		((ret ==-1)) && return 0
+		(( ret == 1 ))   && return 1
+		(( ret == 255 )) && return 0
 	done
 	return 0
 }
 
+# Fill the array named $1 with the default predicate list.
 afu-autoable-default-functions () {
-	local place="$1"
-	afu-error-symif "$0" "$place" defaults || return $?
-	local -a defaults
-	defaults=(afu-autoable-paused-p afu-autoable-large-dir-p afu-autoable-space-p afu-autoable-skipword-p afu-autoable-specials-p afu-autoable-skiplbuffer-p afu-autoable-skipline-p)
-	: ${(PA)place::=$defaults}
+	: ${(PA)1::=$_afu_default_autoable_preds}
 }
+
+# --- The default predicates ---
 
 afu-autoable-paused-p () {
 	(( afu_paused_p == 0 ))
 }
 
+# Completing right after a space would complete the next, still empty word.
+# magic-space wants exactly that, and `man ` never does.
 afu-autoable-space-p () {
-	local c=$LBUFFER[-1]
-	[[ $c == '' ]] && return 1
-	[[ $c == ' ' ]] && {
-		afu-able-space-p || return 1
-	}
+	local c="$LBUFFER[-1]"
+	[[ -z $c ]] && return 1
+	[[ $c == ' ' ]] && { afu-able-space-p || return 1 }
 	return 0
 }
 
 afu-able-space-p () {
-	[[ -z ${AUTO_FU_NOCP-} ]] && {
-		[[ "$WIDGET" == "magic-space" ]] || return 1
-	}
-	local -a x
-	: ${(A)x::=${(z)LBUFFER}}
-	[[ $x[1] != man ]]
+	[[ -z ${AUTO_FU_NOCP-} && $WIDGET != magic-space ]] && return 1
+	local -a cmdwords
+	cmdwords=( ${(z)LBUFFER} )
+	[[ $cmdwords[1] != man ]]
 }
 
 afu-autoable-skipword-p () {
-	local word="$1"
-	afu-autoable-skip-pred word autoable-function/skipwords afu-autoable-skipword-p-default
+	afu-autoable-skip-pred "$1" autoable-function/skipwords \
+		afu-autoable-skipword-p-default
 }
 
+# Words starting with a quote or a history expansion: completing them inserts
+# the wrong thing or triggers the expansion.
 afu-autoable-skipword-p-default () {
-	afu-error-symif "$0" "$1" a tmp || return $?
-	local -a a
-	a=("'" "$'" "$histchars[1]")
-	local -a tmp
-	tmp=("(${(j.|.)a})*")
-	: ${(PA)1::=$tmp}
+	: ${(PA)1::="('|\$'|${histchars[1]})*"}
 }
 
 afu-autoable-skiplbuffer-p () {
-	local lbuffer="$3"
-	afu-autoable-skip-pred lbuffer autoable-function/skiplbuffers
+	afu-autoable-skip-pred "$3" autoable-function/skiplbuffers
 }
 
 afu-autoable-skipline-p () {
-	local line="$4"
-	afu-autoable-skip-pred line autoable-function/skiplines
+	afu-autoable-skip-pred "$4" autoable-function/skiplines
 }
 
+# Unbalanced quotes, shell metacharacters, and rm's flags: completing there
+# either cannot work or is actively unhelpful.
 afu-autoable-specials-p () {
-	zmodload zsh/regex
-	# Check for unbalanced quotes using counting instead of backtracking regex
+	setopt localoptions extendedglob
+
+	# Quote state.  Only the quote characters themselves matter, so throw the
+	# rest of the line away first - this is O(quotes), not O(line length).
+	local quotes="${LBUFFER//[^\"\']/}"
 	local -i dq=0 sq=0 i
-	for (( i=1; i<=${#LBUFFER}; i++ )); do
-		case $LBUFFER[$i] in
+	for (( i = 1; i <= $#quotes; i++ )); do
+		case $quotes[i] in
 			('"') (( sq == 0 )) && (( dq = !dq )) ;;
 			("'") (( dq == 0 )) && (( sq = !sq )) ;;
 		esac
 	done
 	(( dq || sq )) && return 1
-	[[ $LBUFFER[-1] -regex-match "[<> \[\(\)&\|;\"']" ]] && return 1
-	[[ $LBUFFER[-1] -regex-match "\]" ]] && return 1
-	[[ $LBUFFER -regex-match "^.*rm\s*-[a-zA-Z]*$" ]] && return 1
+
+	# A metacharacter under the cursor: whatever comes next is a new word, and
+	# we have nothing to complete from yet.
+	[[ $LBUFFER[-1] == [\<\>\ \[\(\)\&\|\;\"\'\]] ]] && return 1
+
+	# Don't offer completions while typing rm's flags.  (This used to be a
+	# regex using \s, which zsh's POSIX regexes read as a literal "s", so it
+	# only ever matched "rm-rf" and the guard never fired in practice.)
+	[[ $LBUFFER == (|*[[:space:]])rm[[:space:]]#-[a-zA-Z]# ]] && return 1
 	return 0
 }
 
+# Completing in a directory with thousands of entries is slow enough to feel on
+# every keystroke; past this many entries, wait for an explicit Tab.
+: ${AUTO_FU_MAX_DIR_ENTRIES:=200}
+
 afu-autoable-large-dir-p () {
-	local words=(${(s: :)LBUFFER})
-	[[ ${words[-1][-1]} == '/' ]] && words[-1]=${words[-1]%/}
-	local dir="${words[-1]}"
-	[[ -d "$dir" ]] || return 0
+	local -a cmdwords
+	cmdwords=( ${(z)LBUFFER} )
+	local dir="${(Q)cmdwords[-1]}"
+	[[ $dir == */ && $dir != / ]] && dir="${dir%/}"
+	[[ -d $dir ]] || return 0
+
+	# oN: don't sort, we only count.  Y: stop after one entry more than the
+	# limit.  A parameter in the glob is not itself a pattern, so a directory
+	# called "[x]" is matched literally.
 	local -a entries
-	entries=( $dir/*(NY201) )
-	(( ${#entries} > 200 )) && return 1 || return 0
+	entries=( $dir/*(NoNY$((AUTO_FU_MAX_DIR_ENTRIES + 1))) )
+	(( $#entries > AUTO_FU_MAX_DIR_ENTRIES )) && return 1
+	return 0
 }
 
+# --- Helpers ---
+
+# Veto if $1 matches any pattern in the ':auto-fu:var $2' style; if that style
+# is unset, $3 (if given) supplies the default patterns.
 afu-autoable-skip-pred () {
-	local place="$1"
-	local style="$2"
-	local deffn="${3-}"
-	local value="${(P)place}"
+	local value="$1" style="$2" deffn="${3-}"
 	local -a skips
-	skips=()
 	zstyle -a ':auto-fu:var' "$style" skips
-	(($#skips==0)) && [[ -n "$deffn" ]] && {
+	if (( $#skips == 0 )) && [[ -n $deffn ]]; then
 		"$deffn" skips
-	}
+	fi
+
 	local skip
-	for skip in $skips
-	do
-		[[ "${value}" == ${~skip} ]] && {
-			[[ -n "${AUTO_FU_DEBUG-}" ]] && {
-				echo "***BREAK*** ${skip}" >> ${AUTO_FU_DEBUG-}
-			}
+	for skip in $skips; do
+		[[ $value == ${~skip} ]] && {
+			[[ -n ${AUTO_FU_DEBUG-} ]] &&
+				print -r -- "***BREAK*** $skip" >> "$AUTO_FU_DEBUG"
 			return 1
 		}
 	done
 	return 0
 }
 
+# split-shell-arguments with two additions: REPLY always points at a word (not
+# at a separator), and $areply holds just the simple command the cursor is in.
 afu-split-shell-arguments () {
-	autoload -U split-shell-arguments
+	(( $+functions[split-shell-arguments] )) || autoload -Uz split-shell-arguments
 	split-shell-arguments
-	((REPLY & 1)) && ((REPLY--))
-	((REPLY2 = ${#reply[REPLY]-} + 1))
-	local -i p
+	(( REPLY & 1 )) && (( REPLY-- ))
+	(( REPLY2 = ${#reply[REPLY]-} + 1 ))
+
+	# $reply alternates separator, word, separator, word, ... so indices move
+	# in steps of two.  Cut everything before the last command separator at or
+	# left of the cursor, skip any noglob/nocorrect/... prefix, then cut
+	# everything from the next separator on.
 	local -a tmp
-	: ${(A)tmp::=$reply[1,REPLY]}
+	local -i p
+	tmp=( $reply[1,REPLY] )
 	p=${tmp[(I)(\||\|\||;|&|&&)]}
-	((p)) && ((p+=2)) || ((p=1))
-	while [[ ${tmp[p]-} == (noglob|nocorrect|builtin|command) ]]
-	do
-		((p+=2))
+	(( p )) && (( p += 2 )) || (( p = 1 ))
+	while [[ ${tmp[p]-} == (noglob|nocorrect|builtin|command) ]]; do
+		(( p += 2 ))
 	done
-	((p!=1)) && ((p++))
-	: ${(A)tmp::=$reply[p,-1]}
+	(( p != 1 )) && (( p++ ))
+
+	tmp=( $reply[p,-1] )
 	p=${tmp[(I)(\||\|\||;|&|&&)]}
-	((p)) && ((p-=2)) || ((p=-1))
-	: ${(A)areply::=${tmp[1,p]}}
+	(( p )) && (( p -= 2 )) || (( p = -1 ))
+	areply=( $tmp[1,p] )
 }

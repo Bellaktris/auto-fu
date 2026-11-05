@@ -1,0 +1,220 @@
+#!zsh
+# auto-fu-install: registering widgets, keymaps and hooks
+#
+# Everything here runs once, from auto-fu-install - except the ZLE rebinding,
+# which runs per line (cheaply) because auto-fu has to own the editing widgets
+# only while it owns the line.
+
+# --- Extension points ---
+#
+# All three are empty by default.  They exist so another module can claim a
+# widget auto-fu would otherwise take over.
+#
+#   afu_zle_contribs   keys are widgets auto-fu must not rebind at all
+#   afu_rebinds_post   widget -> the command that restores it afterwards
+#   afu_rhs_no_kills   widgets during which dead $region_highlight entries are
+#                      kept rather than dropped
+typeset -gA afu_zle_contribs
+typeset -gA afu_rebinds_post
+typeset -ga afu_rhs_no_kills
+
+# Widgets that accept the line (afu-recursive-edit-and-accept checks this).
+typeset -ga afu_accept_lines
+afu_accept_lines=(afu+accept-line afu+accept-line-and-down-history
+                  afu+accept-and-hold)
+
+typeset -gA afu_keymap_state
+
+# --- Owning the editing widgets for the duration of a line ---
+#
+# While the recursive edit runs, self-insert and friends have to be auto-fu's
+# wrappers; afterwards whatever was installed before (zsh-syntax-highlighting's
+# wrappers, say) has to come back exactly as it was.  The restore commands are
+# worked out once, from whatever is installed the first time round.
+
+typeset -ga _afu_zle_restore_cmds
+
+afu-zle-capture-bindings () {
+	(( $#_afu_zle_restore_cmds )) && return 0
+	local w x
+	for w in $_afu_wrapped_widgets complete-word list-choices; do
+		(( ${+afu_zle_contribs[$w]} )) && continue
+		[[ -n ${afu_rebinds_post[$w]-} ]] && {
+			_afu_zle_restore_cmds+="${afu_rebinds_post[$w]}"
+			continue
+		}
+		x="$widgets[$w]"
+		[[ $x == user:*-by-keymap ]] && continue   # already ours
+		case $x in
+			# $widgets reports completion widgets as "completion:<widget>:<fn>"
+			(completion:*) _afu_zle_restore_cmds+="zle -C $w ${${x#*:}/:/ }" ;;
+			(user:*)       _afu_zle_restore_cmds+="zle -N $w ${x#*:}" ;;
+			# builtin:* needs no restoring: zle -N below is what shadowed it,
+			# and zle -A cannot bring a builtin widget back by name anyway.
+		esac
+	done
+	return 0
+}
+
+afu-zle-rebind-restore () {
+	local cmd
+	for cmd in $_afu_zle_restore_cmds; do
+		eval "$cmd"
+	done
+	return 0
+}
+
+afu-zle-force-install () {
+	local w
+	for w in $_afu_wrapped_widgets; do
+		zle -N $w $w-by-keymap
+	done
+	zle -C complete-word .complete-word _main_complete
+	zle -C list-choices .list-choices _main_complete
+}
+
+with-afu-zle-rebinding () {
+	afu-zle-capture-bindings
+	{
+		afu-zle-force-install
+		"$@"
+	} always {
+		afu-zle-rebind-restore
+	}
+}
+
+# --- Hooks ---
+
+# Add $2 to the front of ZLE hook $1, keeping whatever was there.
+afu-chain-zle-hook () {
+	local hook="$1" newfn="$2"
+	local saved="_afu_orig_${hook//-/_}"
+
+	# Already chained: re-sourcing this module would otherwise point the saved
+	# copy at the chained function, i.e. at itself, and the next prompt would
+	# die in infinite recursion.
+	[[ "${functions[$hook]-}" == *"$newfn"* ]] && return 0
+
+	if (( $+functions[$hook] )); then
+		functions[$saved]=$functions[$hook]
+		eval "$hook () { $newfn \"\$@\"; $saved \"\$@\"; }"
+	else
+		eval "$hook () { $newfn \"\$@\"; }"
+	fi
+	zle -N $hook
+}
+
+afu-install-eof () {
+	zstyle -t ':auto-fu:var' eof-installed-p || {
+		if [[ "$options[ignoreeof]" == "on" ]]; then
+			bindkey "^D" afu+orf-ignoreeof-deletechar-list
+		else
+			setopt ignoreeof
+			bindkey "^D" afu+orf-exit-deletechar-list
+		fi
+	} always {
+		zstyle ':auto-fu:var' eof-installed-p yes
+	}
+}
+
+afu-install-preexec () {
+	zstyle -t ':auto-fu:var' preexec-installed-p || {
+		autoload -Uz add-zsh-hook
+		add-zsh-hook preexec auto-fu-preexec
+	} always {
+		zstyle ':auto-fu:var' preexec-installed-p yes
+	}
+}
+
+# --- Keymaps ---
+
+# Build the afu keymap (a copy of main) and bind the keys auto-fu needs.
+# Any arguments are run before the bindings, so a caller can add its own.
+afu-install () {
+	zstyle -t ':auto-fu:var' misc-installed-p || {
+		# zsh/parameter for $widgets/$functions/$options, zsh/terminfo for the
+		# shift-Tab key.  Both are hard requirements, but failing to load them
+		# is no reason to kill the user's shell.
+		zmodload zsh/parameter 2>/dev/null || {
+			print -u2 'auto-fu: cannot zmodload zsh/parameter; not installing.'
+			return 1
+		}
+		zmodload zsh/terminfo 2>/dev/null || {
+			print -u2 'auto-fu: cannot zmodload zsh/terminfo; not installing.'
+			return 1
+		}
+		afu-install-eof
+		afu-install-preexec
+	} always {
+		zstyle ':auto-fu:var' misc-installed-p yes
+	}
+
+	bindkey -N afu main
+	"$@"
+
+	bindkey -M afu "^I" afu+complete-word-no-timeout
+	bindkey -M afu "^M" afu+accept-line
+	bindkey -N afu-vicmd vicmd
+
+	bindkey -M afu "$terminfo[kcbt]" afu+complete-word-no-timeout
+	bindkey -M menuselect "$terminfo[kcbt]" reverse-menu-complete
+	bindkey -M afu "\e[C" afu-cursor-right
+	bindkey -M afu "\e[D" afu-cursor-left
+
+	# Escape leaves insert mode only if main is a vi keymap.
+	[[ "$(bindkey -lL main)" == *vi* ]] &&
+		bindkey -M afu "\e" afu+vi-cmd-mode
+
+	bindkey -A afu main
+}
+
+# --- Entry point ---
+
+auto-fu-install () {
+	local w
+
+	# The wrapped editing widgets: afu+self-insert and friends.
+	for w in $_afu_wrapped_widgets; do
+		zle -N afu+$w
+	done
+	for w in accept-and-hold accept-line accept-line-and-down-history \
+		complete-word-no-timeout orf-exit-deletechar-list \
+		orf-ignoreeof-deletechar-list vi-cmd-mode vi-ins-mode \
+		vi-visual-exit vi-visual-kill-and-insert vi-visual-kill-and-vicmd
+	do
+		zle -N afu+$w
+	done
+	for w in afu-cursor-left afu-cursor-right auto-fu auto-fu-activate \
+		auto-fu-deactivate auto-fu-init auto-fu-magic-space auto-fu-toggle
+	do
+		zle -N $w
+	done
+
+	# Widgets whose implementing function is named differently: the `~` ones
+	# are the wrapped versions (see auto-fu for the keystroke path).
+	zle -N afu+complete-word  'afu+complete-word~~'
+	zle -N afu+yank-by-keymap yank-by-keymap
+	zle -N auto-fu-extend     'with-afu-magic-insert~'
+	zle -N auto-fu-on         'auto-fu-on~'
+	zle -N auto-fu-off        'auto-fu-off~'
+
+	afu-install || return 1
+
+	afu-chain-zle-hook zle-line-init     afu-zle-line-init
+	afu-chain-zle-hook zle-keymap-select auto-fu-zle-keymap-select
+
+	# vi visual mode, if the editor module built it.
+	[[ -n ${(M)keymaps:#vivis} ]] && {
+		afu+vi-visual-yank () {
+			zle vi-visual-yank
+			zle -K afu
+			zle -K afu-vicmd
+		}
+		zle -N afu+vi-visual-yank
+		bindkey -M vivis 'x' afu+vi-visual-kill-and-vicmd
+		bindkey -M vivis 'c' afu+vi-visual-kill-and-insert
+		bindkey -M vivis "\e" afu+vi-visual-exit
+		bindkey -M vivis 'y' afu+vi-visual-yank
+	}
+	return 0
+}

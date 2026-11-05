@@ -1,0 +1,197 @@
+#!zsh
+# auto-fu-highlight: keeping $region_highlight honest
+#
+# auto-fu shows its inline completion by appending one entry to
+# $region_highlight ("<start> <end> <style>").  Two things make that fiddly:
+#
+#   * The completion is not part of the buffer the user typed, so when the
+#     buffer shrinks under it the entry has to be clipped or dropped, or zsh
+#     highlights text that is no longer there.
+#   * zsh-syntax-highlighting rebuilds $region_highlight from scratch, so our
+#     entry has to be put back after it runs.
+#
+# $afu_rh_state is all the bookkeeping that needs: [cur] is the entry we added
+# last, [old] the one before it.  Both are "<style-name> <start> <end> <style>";
+# the region_highlight entry itself is fields 2..-1.
+
+# --- The entry we added last ---
+
+afu-rh-state-set () {
+	afu_rh_state[old]="${afu_rh_state[cur]-}"
+	afu_rh_state[cur]="$1"
+}
+
+# Remove the previous entry from $region_highlight.
+afu-rh-drop-old () {
+	local -a old
+	old=( ${=afu_rh_state[old]-} )
+	(( $#old )) && (( $#region_highlight )) && {
+		region_highlight=( ${region_highlight:#"$old[2,-1]"} )
+	}
+	return 0
+}
+
+# Remove the previous entry from the array named $1 instead - that is the copy
+# with-afu-region-highlight-saving will restore on the way out, so dropping it
+# from $region_highlight alone would not stick.  No-op outside that wrapper.
+afu-rh-drop-old-from () {
+	local place="$1"
+	[[ -n ${(P)place-} ]] || return 0
+	local -a old
+	old=( ${=afu_rh_state[old]-} )
+	(( $#old )) || return 0
+	: ${(PA)place::=${(P)place:#"$old[2,-1]"}}
+}
+
+# (Re-)add the live entry to $region_highlight unless it is already there.
+afu-rh-add-cur () {
+	local -a cur
+	cur=( ${=afu_rh_state[cur]-} )
+	(( $#cur )) || return 0
+	[[ -n ${(M)region_highlight:#"$cur[2,-1]"} ]] && return 0
+	region_highlight+="$cur[2,-1]"
+	return 0
+}
+
+# Highlight $2..$3 with style $4; $1 names the style for bookkeeping.
+afu-rh-highlight-maybe () {
+	afu-rh-state-set "$1 $2 $3 $4"
+	afu-rh-drop-old
+	afu-rh-add-cur
+}
+
+afu-rh-clear-maybe () {
+	afu-rh-state-set ''
+	afu-rh-drop-old
+}
+
+# --- Protecting pre-existing highlights across an edit ---
+
+afu-rhs-save () {
+	region_highlight+="$1"
+}
+
+# Drop entry $2 from the array named $1.
+afu-rhs-kill () {
+	: ${(PA)1::=${(P)1:#$2}}
+}
+
+# Decide what happens to one pre-existing highlight entry now that the buffer
+# has been edited under it.
+#
+#   $1     name of the array of entries to restore afterwards
+#   $2     t if surviving entries should be re-applied to $region_highlight
+#   $3     t if dead entries should be dropped from that array
+#   $4...  the entry, already split into fields
+afu-rhs-protect () {
+	local place="$1" savep="$2" killp="$3"
+	shift 3
+	local -a a
+	a=( "$@" )
+	local -i beg="$a[1]" end="$a[2]"
+	local style="$a[3,-1]"   # may carry a memo= field in newer zsh
+
+	if [[ -n $RBUFFER ]]; then
+		# Text after the cursor: the entry still describes real text if it ends
+		# before the cursor, or if we are completing (our completion sits at
+		# the cursor and pushes nothing around).
+		if (( CURSOR > end )) || [[ $WIDGET == *complete* ]]; then
+			[[ $savep == t ]] && afu-rhs-save "$a[*]"
+		elif [[ $killp == t ]] && [[ -n ${(P)place-} ]]; then
+			afu-rhs-kill $place "$a[*]"
+		fi
+		return 0
+	fi
+
+	# Nothing after the cursor: clip entries that now run past the end of the
+	# buffer, and drop the ones that start past it entirely.
+	if (( end > $#BUFFER + 1 )); then
+		[[ $killp == t ]] && afu-rhs-kill $place "$a[*]"
+		[[ $savep == t ]] && afu-rhs-save "$beg $#BUFFER $style"
+	elif (( end > $#BUFFER )); then
+		[[ $savep == t ]] && afu-rhs-save "$beg $#BUFFER $style"
+	elif (( beg <= $#BUFFER + 1 )); then
+		[[ $savep == t ]] && afu-rhs-save "$a[*]"
+	fi
+	return 0
+}
+
+# Run "$@" with $region_highlight emptied, restoring on the way out whatever
+# still describes text that exists.  afu+complete-word reaches into
+# $afu_rh_saved (via afu-rh-drop-old-from) to forget a committed completion.
+with-afu-region-highlight-saving () {
+	local -a afu_rh_saved
+	afu_rh_saved=( $region_highlight )
+	region_highlight=()
+	{
+		local h savep killp
+		local -a spec
+		# The list is expanded once, so afu-rhs-kill editing $afu_rh_saved
+		# during the loop is fine.
+		for h in $afu_rh_saved; do
+			spec=( ${=h} )
+			if (( PENDING == 0 )); then
+				savep=t
+				# $afu_rhs_no_kills is empty by default; listing a widget in it
+				# keeps dead entries around while that widget runs.
+				if (( $#afu_rhs_no_kills )) &&
+					[[ -z ${(M)afu_rhs_no_kills:#$WIDGET} ]]; then
+					killp=t
+				else
+					killp=nil
+				fi
+			else
+				# More input already typed ahead: don't re-apply anything, it
+				# will be recomputed for the final keystroke anyway.
+				savep=nil
+				killp=t
+			fi
+			afu-rhs-protect afu_rh_saved $savep $killp "$spec[@]"
+		done
+		"$@"
+	} always {
+		region_highlight=( $afu_rh_saved )
+	}
+}
+
+# --- zsh-syntax-highlighting bridge ---
+
+# Run engine function $1 (always with-afu) and keep zsh-syntax-highlighting in
+# sync.  $1 is told whether it may keep our buffer: zsh-syntax-highlighting
+# repaints the whole line from $BUFFER, so when it is loaded auto-fu has to put
+# the typed buffer back (nil) rather than leave the completion in it (t).
+#
+# Returns 0 even when the wrapped widget failed: ZLE beeps on a non-zero widget
+# return, and "nothing to complete" is not an error.  Every afu+ widget returns
+# 0 for the same reason.
+with-afu-zsh-syntax-highlighting () {
+	local -a rh_old
+	rh_old=( $region_highlight )
+	local b_old="${buffer_cur-}"
+	local -i hip=$+functions[_zsh_highlight]
+
+	if (( hip )); then
+		"$1" nil "${@[2,-1]}"
+	else
+		"$1" t "${@[2,-1]}"
+	fi
+
+	if (( PENDING == 0 )); then
+		if (( hip )); then
+			# zsh-syntax-highlighting caches the buffer and cursor it last
+			# painted; our inline completion changed both behind its back.
+			if (( afu_in_p == 1 )); then
+				[[ "$BUFFER" != "$buffer_cur" ]] && _ZSH_HIGHLIGHT_PRIOR_BUFFER=""
+				(( CURSOR != cursor_cur )) && _ZSH_HIGHLIGHT_PRIOR_CURSOR=-1
+			fi
+			_zsh_highlight
+		fi
+		# _zsh_highlight rebuilt region_highlight from scratch; put ours back.
+		# A no-op when the engine declined to complete, since afu-clearing-maybe
+		# cleared [cur] on the way in.
+		afu-rh-add-cur
+	elif (( ${#${buffer_cur-}} > $#b_old )); then
+		region_highlight=( $rh_old )
+	fi
+	return 0
+}

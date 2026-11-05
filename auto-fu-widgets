@@ -1,81 +1,99 @@
 #!zsh
-# auto-fu-widgets: ZLE widget wrappers and keymap delegation functions
+# auto-fu-widgets: the afu+* ZLE widgets
+#
+# Two generated families, plus the hand-written ones in between:
+#
+#   afu+<widget>            what the afu keymap is bound to; runs the real
+#                           widget through with-afu~ and then completes
+#   <widget>-by-keymap      what the *global* widget is replaced with while
+#                           auto-fu owns the line, so that a keymap can
+#                           override one widget without auto-fu knowing
+#                           (zle <keymap>+<widget>, else the builtin)
 
-# Shared list of wrapped editing widgets (used by auto-fu core too)
+# The editing widgets auto-fu wraps.  auto-fu-install rebinds exactly these.
 typeset -ga _afu_wrapped_widgets
 _afu_wrapped_widgets=(self-insert backward-delete-char backward-kill-word
                       kill-line kill-whole-line kill-word magic-space yank)
-
-# --- Generate afu+ widget wrappers (delegate to with-afu~) ---
 
 for _afu_w in $_afu_wrapped_widgets; do
 	eval "afu+$_afu_w () { with-afu~ .$_afu_w $_afu_wrapped_widgets }"
 done
 
-# --- Accept-line widgets ---
+# --- Accepting the line ---
+#
+# $__accepted is a local of afu-recursive-edit-and-accept: these widgets record
+# what was pressed and end the recursive edit, which then does the real accept.
 
-afu+accept-line () {
-	__accepted=($WIDGET ${=NUMERIC:+-n $NUMERIC} "$@")
-	zle .accept-line
-	zstyle -T ':auto-fu:var' postdisplay/clearp && POSTDISPLAY=""
-	return 0
-}
-afu+accept-and-hold () {
-	__accepted=($WIDGET ${=NUMERIC:+-n $NUMERIC} "$@")
-	zle .accept-and-hold
-	zstyle -T ':auto-fu:var' postdisplay/clearp && POSTDISPLAY=""
-	return 0
-}
-afu+accept-line-and-down-history () {
-	__accepted=($WIDGET ${=NUMERIC:+-n $NUMERIC} "$@")
-	zle .accept-line-and-down-history
-	zstyle -T ':auto-fu:var' postdisplay/clearp && POSTDISPLAY=""
-	return 0
-}
+for _afu_w in accept-line accept-and-hold accept-line-and-down-history; do
+	eval "afu+$_afu_w () {
+		__accepted=(\$WIDGET \${=NUMERIC:+-n \$NUMERIC} \"\$@\")
+		zle .$_afu_w
+		zstyle -T ':auto-fu:var' postdisplay/clearp && POSTDISPLAY=\"\"
+		return 0
+	}"
+done
 
-# --- Vi mode widgets ---
+# --- vi mode ---
+#
+# The afu keymap is the insert-mode counterpart of afu-vicmd.  Leaving insert
+# mode has to commit or drop the inline completion first; the double `zle -K`
+# in the visual widgets is deliberate - it forces zle-keymap-select to fire for
+# the intermediate keymap so the prompt indicator keeps up.
 
 afu+vi-cmd-mode () {
-	((afu_in_p==1)) && BUFFER="$buffer_cur"
+	(( afu_in_p == 1 )) && BUFFER="$buffer_cur"
 	zle -K afu-vicmd
 }
+
 afu+vi-ins-mode () {
 	zle -K afu
 }
+
 afu+vi-visual-exit () {
 	zle vi-visual-exit
 	zle -K afu
 	zle -K afu-vicmd
 }
+
 afu+vi-visual-kill-and-insert () {
 	zle vi-visual-kill-and-vicmd
 	zle -K afu
 }
+
 afu+vi-visual-kill-and-vicmd () {
 	zle vi-visual-kill-and-vicmd
 	zle -K afu
 	zle -K afu-vicmd
 }
 
-# --- EOF widgets ---
+# --- Ctrl-D ---
+#
+# On an empty line Ctrl-D means EOF; anywhere else it deletes or lists.
+# afu-install-eof picks the variant that matches the ignoreeof option.
 
 afu+orf-ignoreeof-deletechar-list () {
 	afu-eof-maybe afu-ignore-eof zle delete-char-or-list
 }
+
 afu+orf-exit-deletechar-list () {
 	afu-eof-maybe exit zle delete-char-or-list
 }
 
 # --- Cursor movement ---
+#
+# Plain forward-char/backward-char would have to deal with the inline
+# completion; moving $CURSOR directly leaves it displayed and lets
+# afu-clearing-maybe notice on the next keystroke.
 
 afu-cursor-right () {
 	(( CURSOR += 1 ))
 }
+
 afu-cursor-left () {
 	(( CURSOR -= 1 ))
 }
 
-# --- Generate keymap delegation wrappers ---
+# --- Keymap delegation ---
 
 for _afu_w in $_afu_wrapped_widgets; do
 	eval "$_afu_w-by-keymap () {

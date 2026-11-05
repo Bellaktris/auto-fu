@@ -1,0 +1,391 @@
+#!zsh
+# auto-fu-complete: zsh completion-system glue, and Tab
+#
+# Everything that talks to _main_complete lives here: how a completion is run
+# (afu-zle-complete-word), what is done around it (the compprefuncs /
+# comppostfuncs hooks), and the Tab handler built on top of both.
+
+# How long a completion may take before it is interrupted, in seconds.  Raising
+# this makes a slow completer (NFS, a hostname lookup) block the keystroke for
+# longer; lowering it makes slow completions silently produce nothing.
+: ${AUTO_FU_TIMEOUT:=0.1}
+
+# Run one completion.
+#
+# Completion happens on every keystroke, so a completer that blocks would hang
+# the shell: a watchdog interrupts it after $AUTO_FU_TIMEOUT.  Tab runs without
+# one (the user is explicitly waiting) - see afu+complete-word-no-timeout.
+#
+# Returns 0 unconditionally: callers chain `afu-zle-complete-word && return`
+# and a non-zero return would silently fall through to the next branch.
+afu-zle-complete-word () {
+	local -i watchdog=0
+	if [[ -z "$AFU_NO_TIMEOUT" ]]; then
+		( sleep $AUTO_FU_TIMEOUT && kill -INT $$ &>/dev/null ) &!
+		watchdog=$!
+	fi
+
+	zle complete-word
+
+	# $! has to be captured above: by now a completer may have started a job of
+	# its own, and killing $! here would kill that - or, with no watchdog
+	# armed, whatever the user last put in the background.
+	(( watchdog )) && kill $watchdog &>/dev/null
+	return 0
+}
+
+# --- Completion hooks ---
+
+# Runs before each completion (compprefuncs).
+afu-comppre () {
+	# Coming from an afu+ widget other than Tab: start a fresh match set and
+	# insert only the unambiguous part.
+	[[ $LASTWIDGET == afu+*~afu+complete-word ]] && {
+		compstate[old_list]=
+		compstate[insert]=automenu-unambiguous
+	}
+	# Tab with a single match: don't reuse the old list, it is spent.
+	[[ $LASTWIDGET == afu+complete-word ]] && (( _lastcomp[nmatches] == 1 )) && {
+		compstate[old_list]=
+	}
+
+	# Route _match and _approximate through our wrappers so we can tell whether
+	# they corrected or expanded anything (see with-afu-completer-tracking).
+	{
+		local -a match mbegin mend
+		local c='_(match|approximate)'
+		_completers=( ${_completers/(#b)(#s)(${~c})(#e)/_afu${match[1]}} )
+	}
+
+	[[ -n ${(M)_completers:#(_afu)#_match} ]] && {
+		local tmp="${${:-$PREFIX$SUFFIX}#[~=]}"
+		# NOTE: meant to be ${tmp:q} - as written this compares "X:q" against
+		# "X" and so is never true, which means the early return below never
+		# happens.  Left alone on purpose: enabling it changes which completers
+		# run for an already-quoted word.
+		[[ "$tmp:q" = "$tmp" ]] && return
+		# _match is going to expand a pattern; _approximate on top of that
+		# corrects the expansion, which is never what you want.
+		_completers=( ${_completers:#(_afu)#_approximate} )
+		[[ ${afu_match_rec_p} == t ]] && _completers=()
+	}
+}
+
+# Runs after each completion (comppostfuncs).
+afu-comppost () {
+	# A list taller than the terminal would scroll the prompt away.
+	(( compstate[list_lines] + BUFFERLINES + 2 > LINES )) && {
+		compstate[list]=''
+		[[ $WIDGET == afu+complete-word ]] || compstate[insert]=''
+		zle -M "$compstate[list_lines]($compstate[nmatches]) too many matches..."
+	}
+	typeset -g afu_one_match_p=
+	(( compstate[nmatches] == 1 )) && afu_one_match_p=t
+	afu_curcompleter=$_completer
+	_list_prefix=""
+}
+
+with-afu-compfuncs () {
+	compprefuncs=(afu-comppre)
+	comppostfuncs=(afu-comppost)
+	"$@"
+}
+
+# Run "$@" with the completion settings auto-fu needs: never accept an exact
+# match outright (we want to show what else there is), and no list limit (the
+# list is suppressed by afu-comppost instead).
+with-afu-completer-vars () {
+	setopt localoptions no_recexact
+	local LISTMAX=999999
+	with-afu-compfuncs "$@"
+}
+
+# Remember what the *previous* completion did, then reset for this one.  Tab
+# and _approximate both need to know whether they are a repeat.
+with-afu-completer-tracking () {
+	local afucompletewordp="${1-}"
+
+	last_afucompleteword_p=
+	[[ -n ${afu_complete_word-} ]] && last_afucompleteword_p=t
+	afu_complete_word="${afucompletewordp}"
+
+	last_afuapproximatecorrecting_p=
+	[[ -n ${afu_approximate_correcting_p-} ]] && last_afuapproximatecorrecting_p=t
+
+	afu_curcompleter=
+	afu_approximate_correcting_p=
+	afu_match_ret=
+	afu_match_rec_p=
+}
+
+# --- Wrapped completers ---
+#
+# _match expands patterns and _approximate fixes typos; both rewrite the line,
+# so auto-fu has to know when they did.  Both also show the word they ended up
+# with in the message area, since the buffer still shows what was typed.
+
+_afu_match () {
+	local -i ret
+	afu_match_ret=
+	_match
+	ret=$?
+	afu_match_ret=$ret
+	afu-completer-init-maybe $ret
+	return $ret
+}
+
+_afu_approximate () {
+	local -i ret
+	afu_approximate_correcting_p=
+	_approximate
+	ret=$?
+	afu_approximate_correcting_p=$ret
+	afu-completer-init-maybe $ret
+	return $ret
+}
+
+afu-completer-init-maybe () {
+	local -i ret="$1"
+	(( ret )) && return $ret
+	local b="$BUFFER"
+	# Too long for one line: show the tail with an ellipsis.
+	if (( ${(m)#b} + 4 > COLUMNS - 1 )); then
+		: ${b::=%B...%b${(ml:$((COLUMNS - 4 - 3)):::::)b}}
+	fi
+	_message "%B{%b $b %B}%b"
+	return $ret
+}
+
+# --- menuselect ---
+#
+# Completers that insert something into the buffer themselves, so auto-fu must
+# not simply overwrite it with what the user typed.
+typeset -g _afu_inserting_completers='*(approximate|match|ignored)'
+
+# Run the engine ($1, always auto-fu) in a way that copes with those completers.
+with-afu-menuselecting-handling () {
+	local fn="$1"
+
+	# About to commit the line anyway: just show the list.
+	[[ ${afu_curcompleter-} == ${~_afu_inserting_completers} ]] &&
+		[[ $WIDGET == (magic-space|accept-line*) ]] && {
+			with-afu-completer-vars zle list-choices
+			return
+		}
+
+	# afu-handle-menuselecting-buffer-keep-p sets this when the keystroke
+	# accepted a correction, so the menu must not be reopened.
+	typeset -g afu_force_menuselect_off_p=
+	$fn afu-handle-menuselecting-buffer-keep-p
+
+	[[ ${afu_curcompleter-} == ignored ]] && return
+	[[ -n ${last_afuapproximatecorrecting_p-} ]] && return
+
+	# A pattern was expanded but nothing is committed yet and there is more
+	# than one candidate: complete again so the menu matches the buffer.
+	[[ -z ${last_afucompleteword_p-} ]] &&
+		[[ -z ${afu_force_menuselect_off_p} ]] &&
+		[[ -z ${afu_one_match_p-} ]] &&
+		[[ -n ${afu_match_ret-} ]] && (( afu_match_ret == 0 )) && {
+			with-afu-completer-vars afu-zle-complete-word
+		}
+}
+
+# Passed to the engine as its keep-buffer predicate: 0 keeps what the inserting
+# completer put in the buffer, 1 lets auto-fu put the typed line back.
+# ("hmbk" in afu-hmbk-selected-key-p is short for this function's name.)
+afu-handle-menuselecting-buffer-keep-p () {
+	[[ ${afu_curcompleter-} == ${~_afu_inserting_completers} ]] || return
+
+	# _approximate corrected the line.  A key that ends the word accepts the
+	# correction; ':' and '[' are typed over it.
+	[[ -n ${afu_approximate_correcting_p-} ]] && {
+		afu-hmbk-selected-key-p && {
+			afu_force_menuselect_off_p=t
+			return 0
+		}
+		[[ $KEYS[-1] == [[:]] ]] && {
+			[[ $LBUFFER[-1] == ' ' ]] && LBUFFER="$LBUFFER[1,-2]"
+			[[ $LBUFFER[-1] == $KEYS[-1] ]] && LBUFFER="$LBUFFER[1,-2]"
+			return 0
+		}
+	}
+
+	# _match expanded a pattern.  With several matches, keep the expansion and
+	# let afu-comppre recurse into it.
+	[[ -n ${afu_match_ret-} ]] && (( afu_match_ret == 0 )) && {
+		(( _lastcomp[nmatches] == 1 )) && return 0
+		afu_match_rec_p=t
+		afu-hmbk-selected-key-p && return 0 || return 1
+	}
+
+	# A '/' that came from the menu rather than from the user: drop it.
+	afu-hmbk-selected-key-p || {
+		[[ $LBUFFER[-1] == $KEYS[-1] ]] && [[ $LBUFFER[-1] == '/' ]] && {
+			LBUFFER="$LBUFFER[1,-2]"
+			afu_force_menuselect_off_p=t
+		}
+	}
+}
+
+# Did this keystroke end the word (and so select whatever was displayed)?
+afu-hmbk-selected-key-p () {
+	[[ $KEYS[-1] == ' ' ]] && {
+		# Space after a space, with several matches: the first space already
+		# ended the word, so drop the duplicate.
+		[[ $LBUFFER[-1] == ' ' ]] && [[ -z ${afu_one_match_p-} ]] && {
+			LBUFFER="$LBUFFER[1,-2]"
+		}
+		return 0
+	}
+	[[ $KEYS[-1] == $'\n' ]] && return 0
+	[[ $KEYS[-1] == $'\r' ]] && return 0
+	[[ $KEYS[-1] == '/' ]] && return 0
+	return 1
+}
+
+# --- Tab ---
+
+afu+complete-word-no-timeout () {
+	# local, not a global plus unset: this keeps a user-exported
+	# AFU_NO_TIMEOUT intact and cannot leak if the widget errors out.
+	local AFU_NO_TIMEOUT=1
+	afu+complete-word "$@"
+}
+
+'afu+complete-word~' () {
+	with-afu-region-highlight-saving afu+complete-word "$@"
+}
+
+'afu+complete-word~~' () {
+	zle auto-fu-extend -- afu+complete-word~
+}
+
+# Tab.  What it should do depends on what is on screen:
+#
+#   an inline completion is showing  -> commit it, then start cycling
+#   nothing is showing               -> complete as usual
+#   the word ends in '/'             -> push the '/' back so the next path
+#                                       component completes straight away
+#
+# $1, if given, goes to afu-clearing-maybe (t clears $region_highlight first).
+afu+complete-word () {
+	afu-clearing-maybe "${1-}"
+	with-afu-completer-tracking t
+
+	afu-able-p || { afu-zle-complete-word; return 0 }
+
+	local lastcompp=nil
+	[[ $LASTWIDGET == *complete* ]] && lastcompp=t
+
+	# Arm afu-comppre/afu-comppost for the bare afu-zle-complete-word calls
+	# below.  Deliberately not with-afu-completer-vars: on Tab, rec_exact and
+	# LISTMAX stay at their normal values so Tab lists like a plain Tab.
+	with-afu-compfuncs
+
+	if (( afu_in_p == 1 )); then
+		afu-complete-word-accept-inline $lastcompp
+	else
+		afu-complete-word-begin $lastcompp
+	fi
+	return 0
+}
+
+# An inline completion is on screen: commit it, and work out what Tab should do
+# after that.  $1 is t if the previous widget was itself a completion.
+afu-complete-word-accept-inline () {
+	local lastcompp="$1"
+
+	afu_in_p=0
+	CURSOR="$cursor_new"
+
+	case $LBUFFER[-1] in
+		(=)
+			# "--opt=": complete the option's argument rather than a new word.
+			local x="${${(@z)LBUFFER}[-1]}"
+			[[ $x == -* ]] && { afu-zle-complete-word; return 0 }
+			;;
+		(/)
+			afu-reinsert-last-char
+			return 0
+			;;
+		(,)
+			# A list separator (-o a,b): back to the typed line and complete
+			# the next element.
+			BUFFER="$buffer_cur"
+			afu-zle-complete-word
+			return 0
+			;;
+	esac
+
+	# Still inside the word and more than one candidate: start cycling.
+	[[ $lastcompp == t ]] && (( _lastcomp[nmatches] > 1 )) &&
+		[[ $LBUFFER[-1] != [[:space:]] ]] && afu-zle-complete-word
+
+	# The word is finished (single match, or we are past a space).  Forget the
+	# match set so the next Tab completes the next word, and forget the
+	# highlight for the completion we just committed.
+	if (( _lastcomp[nmatches] == 1 )) || [[ $LBUFFER[-1] == [[:space:]] ]]; then
+		_lastcomp[nmatches]=0
+		afu-rh-drop-old-from afu_rh_saved
+	fi
+	return 0
+}
+
+# Nothing on screen: a plain Tab.  $1 is t if the previous widget completed.
+afu-complete-word-begin () {
+	local lastcompp="$1"
+
+	# Returning from another afu+ widget: drop whatever it left displayed.
+	[[ $LASTWIDGET == afu+*~afu+complete-word ]] && {
+		afu_in_p=0
+		BUFFER="$buffer_cur"
+	}
+	# Returning from Ctrl-C: auto-fu is off, so show the list explicitly.
+	[[ $LASTWIDGET == auto-fu-deactivate ]] && {
+		_lastcomp[nmatches]=0
+		zle list-choices
+	}
+
+	# compinit always declares $_lastcomp, so the first test holds in any live
+	# shell; the chain only matters without the completion system, where there
+	# is nothing useful to do anyway.
+	(( $+_lastcomp )) ||
+		{ [[ $lastcompp == t ]] && [[ -n $_lastcomp[nmatches] ]] } ||
+		[[ $LBUFFER[-1] == [[:space:]] ]] ||
+		return 0
+
+	afu-complete-word-arm-magic-insert
+
+	if [[ $LBUFFER[-1] != '/' ]] || (( ${_lastcomp[nmatches]:-0} > 1 )); then
+		afu-zle-complete-word
+		# automenu-unambiguous only inserted the common prefix; complete once
+		# more to actually open the menu.
+		[[ "$_lastcomp" == *automenu-unambiguous* ]] &&
+			[[ $LBUFFER[-1] != [[:space:]] ]] && afu-zle-complete-word
+	else
+		afu-reinsert-last-char
+	fi
+	return 0
+}
+
+# zsh is about to insert just the unambiguous prefix.  Note that, so the next
+# self-insert can take back the character it duplicates (with-afu-magic-insert).
+afu-complete-word-arm-magic-insert () {
+	[[ -n $_lastcomp ]] || return 0
+	[[ $_lastcomp[completer] == complete ]] || return 0
+	[[ -n $_lastcomp[unambiguous] ]] || return 0
+	[[ $_lastcomp[prefix] == $_lastcomp[unambiguous] ]] && return 0
+	(( _lastcomp[nmatches] == 1 )) && return 0
+	afu_magic_insert_p=t
+	afu-zle-complete-word
+}
+
+# Take the last character back out of the buffer and feed it to ZLE again, so
+# whatever is bound to it runs - normally self-insert, which starts a fresh
+# completion for the next path component.
+afu-reinsert-last-char () {
+	local c="$LBUFFER[-1]"
+	LBUFFER="$LBUFFER[1,-2]"
+	zle -U "$c"
+}

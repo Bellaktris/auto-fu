@@ -1,0 +1,421 @@
+#!zsh
+# auto-fu-core: the engine
+#
+# auto-fu (the function) is the whole trick: run a completion, keep the result
+# on screen, put the buffer and cursor back the way the user left them.
+# Everything else here is state around that - what the widgets go through on
+# the way in, when the inline completion is considered stale, and the recursive
+# edit that owns the line.
+#
+# State, all global so the widgets and modules/fzf/init.zsh can see it:
+#
+#   afu_in_p      1 while a completion is displayed but not committed
+#   afu_paused_p  1 while auto-fu is switched off (auto-fu-deactivate)
+#   buffer_cur    $BUFFER as typed, without the completion
+#   cursor_cur    $CURSOR as typed
+#   buffer_new    $BUFFER with the completion in it
+#   cursor_new    $CURSOR at the end of the completion
+
+# --- Widget entry points ---
+
+'with-afu~' () {
+	zle auto-fu-extend -- with-afu "$@"
+}
+
+# Run an editing widget, then auto-complete if auto-fu is enabled for it.
+#
+#   $1   t to clear $region_highlight first
+#   $2   the widget to run (.self-insert, .backward-delete-char, ...)
+#   $3+  every widget auto-fu wraps; the enable/disable styles are matched
+#        against this list, so a disabled widget still runs - it just doesn't
+#        auto-complete afterwards
+#
+# Always returns 0; see with-afu-zsh-syntax-highlighting for why.
+with-afu () {
+	local clearp="$1" zlefun="$2"
+	shift 2
+	local -a zs
+	zs=( "$@" )
+
+	with-afu-completer-tracking
+	afu-clearing-maybe "$clearp"
+	(( afu_in_p == 1 )) && {
+		afu_in_p=0
+		BUFFER="$buffer_cur"
+	}
+
+	with-afu-region-highlight-saving zle $zlefun || return 0
+	afu-enabled-for-p "$zlefun" $zs && auto-fu-maybe
+	return 0
+}
+
+# Is auto-completion enabled for widget $1?  ':auto-fu:var enable' is a list of
+# widget names or `all`; with `all`, ':auto-fu:var disable' subtracts from it.
+# $2... is the full list of wrapped widgets.
+afu-enabled-for-p () {
+	setopt localoptions extendedglob no_banghist
+	local w="${1#.}"
+	shift
+	local -a es ds
+	zstyle -a ':auto-fu:var' enable es
+	(( $#es )) || es=(all)
+	if [[ -n ${(M)es:#(#i)all} ]]; then
+		zstyle -a ':auto-fu:var' disable ds
+		es=( ${@:#(${~${(j.|.)ds}})} )
+	fi
+	[[ -n ${(M)es:#$w} ]]
+}
+
+# self-insert right after Tab inserted the unambiguous prefix would duplicate
+# the character the user is typing; take the inserted one back out first.
+with-afu-magic-insert () {
+	typeset -g afu_magic_insert_p
+	{
+		if [[ $WIDGET == self-insert ]] &&
+			[[ $LASTWIDGET == afu+complete-word ]] &&
+			[[ $afu_magic_insert_p == t ]] &&
+			[[ ${LBUFFER% } == *$KEYS ]]
+		then
+			LBUFFER=${${LBUFFER% }%$KEYS}
+		fi
+		"$@"
+	} always {
+		[[ $WIDGET == afu+complete-word ]] || afu_magic_insert_p=nil
+	}
+	return 0
+}
+
+'with-afu-magic-insert~' () {
+	with-afu-magic-insert with-afu-resume "$@"
+}
+
+with-afu-resume () {
+	afu-resume-maybe
+	with-afu-zsh-syntax-highlighting "$@"
+}
+
+# ':auto-fu:var resume' lists widgets that switch auto-fu back on.
+afu-resume-maybe () {
+	zstyle -t ':auto-fu:var' resume "$WIDGET" && auto-fu-activate
+}
+
+# --- The engine ---
+
+# Complete now, unless input is still coming, the predicates say no, or the
+# line is multi-line (only the last line can be completed meaningfully).
+auto-fu-maybe () {
+	(( PENDING == 0 )) || return 1
+	afu-able-p || return 1
+	[[ $LBUFFER == *$'\n'* ]] && return 1
+	with-afu-menuselecting-handling auto-fu
+	return 0
+}
+
+# Run a completion and show the result inline.
+#
+# $1, if given, names a predicate deciding whether the completion may stay in
+# the buffer when it changed more than the tail of the line; empty means
+# "always keep" (that is the case when auto-fu is invoked as a widget).
+auto-fu () {
+	# Only complete at the end of a word.
+	[[ ${#LBUFFER} != ${#BUFFER} && $BUFFER[$(( ${#LBUFFER} + 1 ))] != ' ' ]] && return
+
+	local keepbufferp="$1"
+	cursor_cur="$CURSOR"
+	buffer_cur="$BUFFER"
+	with-afu-region-highlight-saving
+	with-afu-completer-vars
+
+	local -a cmdwords
+	cmdwords=( ${(z)LBUFFER} )
+	local word="${cmdwords[-1]}"
+
+	# '**' is far too expensive to expand on every keystroke, and any other
+	# pattern can only be listed - there is no single unambiguous completion to
+	# show inline.
+	[[ $word == *'**'* ]] && return
+	if [[ $word == *[*?\<\|\[\#\^]* ]]; then
+		zle list-choices
+	else
+		afu-zle-complete-word
+		# The history completer matched the whole line; complete again to get
+		# the word-level match.
+		[[ $_lastcomp[completer] == history ]] && afu-zle-complete-word
+	fi
+
+	cursor_new="$CURSOR"
+	buffer_new="$BUFFER"
+
+	if [[ "$buffer_cur[1,cursor_cur]" == "$buffer_new[1,cursor_cur]" ]]; then
+		# Everything the user typed survived: the completion only added text at
+		# the cursor, so show it inline and leave the cursor where it was.
+		CURSOR="$cursor_cur"
+		afu-highlight-completion
+		if [[ "$buffer_cur" != "$buffer_new" ]] || (( cursor_cur != cursor_new )); then
+			afu_in_p=1
+			$keepbufferp || afu-list-choices-for-typed
+		fi
+	else
+		# The completion rewrote part of what was typed (a correction, or a
+		# pattern expansion).  Either the completer owns the buffer now, or we
+		# put the typed line back and only list.
+		$keepbufferp || afu-restore-typed-and-list
+	fi
+}
+
+# Highlight the inline completion: from the cursor to the end of what the
+# completion inserted, in the ':auto-fu:highlight' style.
+afu-highlight-completion () {
+	local hi hiv
+	[[ $afu_one_match_p == t ]] && hi=completion/one || hi=completion
+	zstyle -s ':auto-fu:highlight' "$hi" hiv
+	[[ -z ${hiv} ]] && return 0
+	local -i end=$cursor_new
+	# AUTO_PARAM_SLASH and friends add a trailing space; don't highlight it.
+	[[ $BUFFER[$cursor_new] == ' ' ]] && (( end-- ))
+	afu-rh-highlight-maybe $hi $CURSOR $end $hiv
+}
+
+# List the candidates for the line as typed, without disturbing what is on
+# screen - BUFFER, CURSOR and region_highlight are shadowed for the call, so
+# the inline completion stays displayed.
+afu-list-choices-for-typed () {
+	local -a region_highlight
+	region_highlight=()
+	local BUFFER="$buffer_cur"
+	local CURSOR="$cursor_cur"
+	with-afu-completer-vars zle list-choices
+}
+
+# Throw the completion away, put the typed line back, and list instead.
+afu-restore-typed-and-list () {
+	BUFFER="$buffer_cur"
+	CURSOR="$cursor_cur"
+	with-afu-completer-vars zle list-choices
+}
+
+# --- State ---
+
+# The buffer moved out from under the inline completion, so it is stale.
+afu-clearing-maybe () {
+	[[ "$1" == t ]] && region_highlight=()
+	afu-rh-clear-maybe
+	(( afu_in_p == 1 )) && {
+		[[ "$BUFFER" != "$buffer_new" ]] || (( CURSOR != cursor_cur ))
+	} && afu_in_p=0
+	return 0
+}
+
+afu-reset () {
+	region_highlight=()
+	afu_in_p=0
+	local ps
+	zstyle -s ':auto-fu:var' postdisplay ps
+	[[ -n ${ps} ]] && POSTDISPLAY=""
+	return 0
+}
+
+auto-fu-activate () {
+	afu_paused_p=0
+}
+
+auto-fu-deactivate () {
+	afu_paused_p=1
+}
+
+auto-fu-toggle () {
+	(( afu_paused_p = !afu_paused_p ))
+	# ZLE beeps on a non-zero widget return, and (( x = 0 )) is "false".
+	return 0
+}
+
+auto-fu-on () {
+	with-afu-gvars zle -K afu
+}
+
+auto-fu-off () {
+	with-afu-gvars zle -K emacs
+}
+
+'auto-fu-on~' () {
+	afu-zle-force-install
+	auto-fu-on
+}
+
+'auto-fu-off~' () {
+	afu-zle-force-install
+	auto-fu-off
+}
+
+# Create the engine's state.  auto-fu-on/off are for shells that do *not* run
+# auto-fu-init; with the recursive edit in effect, afu-line-init owns the state
+# and switching keymaps underneath it would corrupt it.
+with-afu-gvars () {
+	(( auto_fu_init_p == 1 )) && {
+		zle -M "Sorry, can't turn on or off if auto-fu-init is in effect."
+		return
+	}
+	typeset -g afu_in_p=0
+	typeset -g afu_paused_p=0
+	typeset -gA afu_rh_state
+	"$@"
+}
+
+# --- Odds and ends ---
+
+# Reset the terminal before running a command: the inline completion was drawn
+# with an SGR sequence that the command would otherwise inherit.
+auto-fu-preexec () {
+	print -n $'\e[0m'
+}
+
+afu-eof-maybe () {
+	local eof="$1"
+	shift
+	[[ -z $BUFFER ]] && { $eof; return }
+	"$@"
+}
+
+afu-ignore-eof () {
+	zle -M "zsh: use 'exit' to exit."
+}
+
+# magic-space, with the trailing slash of a just-completed directory removed:
+# "cd /usr/ " is not what was meant, "cd /usr " is.
+auto-fu-magic-space () {
+	if {
+			afu-autoable-paused-p
+		} &&
+		[[ -n "${_lastcomp[prefix]-}" ]] &&
+		[[ -n "${_lastcomp[unambiguous]-}" ]] &&
+		[[ "${_lastcomp[insert_positions]-}" != *:* ]] &&
+		[[ "${_lastcomp[prefix]-}" == "${_lastcomp[unambiguous]}" ]] &&
+		(( CURSOR == _lastcomp[insert_positions] )) &&
+		[[ "$LBUFFER" == *"${_lastcomp[prefix]-}" ]] &&
+		[[ "$LBUFFER" == *[^[:space:]=]/ ]]
+	then
+		LBUFFER="$LBUFFER[1,-2]"
+	fi
+	zle .magic-space
+}
+
+# --- Keymap tracking ---
+#
+# 'main' is an alias for whichever keymap is actually in use, so a switch *to*
+# 'main' loses the information of which one that is.  Remember the last
+# transition and re-select the keymap we came from.
+
+afu-adjust-main-keymap () {
+	[[ "$KEYMAP" == 'main' ]] && zle -K "$1"
+}
+
+# zle-keymap-select passes the keymap being left; $KEYMAP is the one being
+# entered.  $@[-1] is the function to hand the remembered keymap to.
+afu-track-keymap () {
+	local new="$KEYMAP" old="${@[-2]}" fun="${@[-1]}"
+	afu-track-keymap-skip-p "$old" "$new" && return
+
+	local prev="${afu_keymap_state[cur]-}"
+	afu_keymap_state[old]="$prev"
+	afu_keymap_state[cur]="$old $new"
+
+	[[ "$new" == 'main' ]] && [[ -n "$prev" ]] && {
+		local -a tmp
+		tmp=( "${(Q)=prev}" )
+		afu_keymap_state[cur]="$old $tmp[1]"
+		"$fun" "$tmp[1]"
+	}
+}
+
+# Skip transitions we know nothing about, and any involving a keymap listed in
+# ':auto-fu:var track-keymap-skip'.
+afu-track-keymap-skip-p () {
+	local old="$1" new="$2"
+	[[ -z "$old" || -z "$new" ]] && return 0
+	local -a ms
+	zstyle -a ':auto-fu:var' track-keymap-skip ms
+	(( $#ms )) || return 1
+	local m
+	for m in $ms; do
+		[[ "$old" == "$m" || "$new" == "$m" ]] && return 0
+	done
+	return 1
+}
+
+auto-fu-zle-keymap-select () {
+	afu-track-keymap "$@" afu-adjust-main-keymap
+
+	# $auto_fu_init_p is a local of afu-line-init, visible here because the
+	# recursive edit runs inside it: while it owns the line, a switch to 'main'
+	# is its own doing and needs no redisplay.
+	(( auto_fu_init_p == 1 )) && [[ ${KEYMAP-} == main ]] && return
+
+	buffer_cur=$BUFFER
+	[[ ${KEYMAP-} == afu ]] && afu-able-p && {
+		zle list-choices
+		BUFFER="$buffer_cur"
+	}
+
+	# prezto's editor module owns the prompt; let it redisplay, since it also
+	# updates the keymap indicator.
+	if (( $+widgets[editor-info] )); then
+		zle editor-info
+	else
+		zle -R
+		zle reset-prompt
+	fi
+}
+
+# --- Line init ---
+
+auto-fu-init () {
+	with-afu-zle-rebinding afu-line-init
+}
+
+afu-zle-line-init () {
+	afu_in_p=0
+	auto-fu-init
+}
+
+# Own the line: everything happens inside a recursive edit in the afu keymap,
+# with the engine's state shadowed so it cannot leak into the next line.
+afu-line-init () {
+	local auto_fu_init_p=1
+	local ps
+	{
+		local -A afu_rh_state
+		local afu_in_p=0
+		local afu_paused_p=0
+		zstyle -s ':auto-fu:var' postdisplay ps
+		[[ -n ${ps} ]] && POSTDISPLAY="$ps"
+		afu-recursive-edit-and-accept
+	} always {
+		[[ -n ${ps} ]] && POSTDISPLAY=""
+	}
+}
+
+afu-recursive-edit-and-accept () {
+	# Filled in by the afu+accept-* widgets while the recursive edit runs.
+	local -a __accepted
+
+	zle recursive-edit -K afu || {
+		afu-reset
+		zle -R ''
+		zle send-break
+		return
+	}
+
+	# NOTE: the count below can never exceed 1 - each widget appears once in
+	# $afu_accept_lines - so the first branch is dead and accept-and-hold and
+	# accept-line-and-down-history fall back to a plain accept-line.  Left
+	# alone: the afu+accept-* widgets have already run their .accept-*, so
+	# re-invoking them here would accept the line twice.
+	if [[ -n ${__accepted} ]] &&
+		(( ${#${(M)afu_accept_lines:#${__accepted[1]}}} > 1 ))
+	then
+		zle "${__accepted[@]}"
+	else
+		(( afu_in_p == 1 )) && BUFFER="$buffer_cur"
+		zle accept-line
+	fi
+}
